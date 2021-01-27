@@ -1,0 +1,6 @@
+How to build a deb-package:
+
+cd build
+
+cmake ../
+make package
