@@ -1,0 +1,314 @@
+#!/bin/bash
+
+# Select block device (SD card, flash drive) and write ISO image (or any) using dd
+#
+# Author: Aleksey Polygaev, a.polygaev@gmail.com
+#
+# Command line parameters:
+#
+# $1 - source device or ISO image filename (default: select using dialog)
+# $2 - target device (default: select using dialog)
+
+SCRIPT_FOLDER="$(dirname $(readlink -f $0))"
+SCRIPT_PATH="$(pwd)/$0"
+SCRIPT_NAME=$(basename $0)
+
+SCRIPT_VERSION=0.1.2
+
+# Exit on error
+set -e
+
+# Functions
+check_cmd() {
+    if ! type "${1}" 1>/dev/null 2>/dev/null; then
+       echo "Error: Command '$1' not found - please install '$1' and try again"
+       exit 1
+    fi
+}
+
+# Setup PATH
+PATH="${PATH}:/sbin:/usr/local/sbin"
+
+# Check for required packages
+check_cmd lsblk
+check_cmd blockdev
+check_cmd grep
+check_cmd sed
+check_cmd awk
+check_cmd dd
+check_cmd tr
+check_cmd sync
+
+# Script global variables
+SOURCE="" 
+SOURCE_TYPE="" # possibly values: iso, block
+SOURCE_SIZE=""
+TARGET=""
+
+# Functions definitions
+
+# Search and select block device
+#
+# $1 - device type to search (disk, part, rom)
+#
+# Returns variables:
+#   DEVICE     - Selected device (example: /dev/sda)
+#   SIZE       - Device size from lsblk output (example: 64G)
+#   ID         - Device id from /dev/disk/by-id (example: usb-Generic-UDisk-0:0)
+#   MOUNTPOINT - Device mount point (example: /media/<user>/<label>)
+select_block_device() {
+    local device_type="${1}"
+
+    # Search for block devices
+    local DEVICES=($(lsblk -o NAME,TYPE -n -l | grep ${device_type} | sed "s/${device_type}//"))
+    local SIZES=($(lsblk -o SIZE,TYPE -n -l | grep ${device_type} | sed "s/${device_type}//"))
+
+    if [ ${#DEVICES[@]} -eq 0 ]; then
+        echo "No block devices found - exiting"
+        exit 1
+    fi
+
+    # Search for block devices ids
+    local IDS_TMP=($(ls /dev/disk/by-id))
+    local IDS=()
+
+    for d in "${DEVICES[@]}"; do
+        local id_found=0
+
+        for current_id in "${IDS_TMP[@]}"; do
+            local associated_device
+            associated_device=$(readlink -f "/dev/disk/by-id/${current_id}")
+
+            if [ "${associated_device}" = "/dev/${d}" ]; then
+                id_found=1
+                IDS+=("${current_id}")
+                break
+            fi
+        done
+
+        if [ ! ${id_found} -eq 1 ]; then
+            IDS+=("Unknown")
+        fi
+    done
+
+    # Search for mount points
+    local MOUNTPOINTS=()
+
+    for d in "${DEVICES[@]}"; do
+        mp=$(lsblk -l -o MOUNTPOINT -n "/dev/${d}")
+        mp=$(echo "${mp}" | tr '\n' ' ' | sed 's/^ //g' | sed 's/ $//g')
+
+        if [ ! -z "${mp}" ]; then
+            MOUNTPOINTS+=("${mp}")
+        else
+            MOUNTPOINTS+=("None")
+        fi
+    done
+
+    # Show block devices
+    local header
+    header=$(printf "%s \t %-10.10s \t %-10.10s \t %-40.40s \t %-20.20s \t\n" \
+                          "NUM:" "NAME:" "SIZE:" "ID:" "Mount-point:")
+    echo "${header}"
+
+    printf "%0.1s" "-"{1..100}
+    echo
+
+    local i=0
+    for d in "${DEVICES[@]}"; do
+        printf "%s \t %-10.10s \t %-10.10s \t %-40.40s \t %-20.20s \t\n" \
+            "${i}" "/dev/${DEVICES[$i]}" "${SIZES[$i]}" "${IDS[$i]}" "${MOUNTPOINTS[$i]}"
+        i=$((i + 1))
+    done
+
+    printf "%0.1s" "-"{1..100}
+    echo
+
+    # Select block device
+    while true; do
+        echo -n "Enter block device number (Ctrl+C to exit):"
+        read -r num
+
+        # Check 'num' is a number
+        local regexp="^[0-9]+$"
+
+        if [[ ! "${num}" =~ ${regexp} ]]
+        then
+            echo "Wrong input: 'num' must be a number"
+            continue
+        fi
+
+        # Check for number value
+        if [ "${num}" -lt 0 ] || [ "${num}" -ge ${#DEVICES[@]} ]
+        then
+            echo "Error: device num must be between 0 and $((${#DEVICES[@]} - 1))"
+            continue
+        else
+            # Input ok
+            break
+        fi
+    done
+    echo
+
+    DEVICE="/dev/${DEVICES[$num]}"
+    SIZE="${SIZES[$num]}"
+    ID="${IDS[$num]}"
+    MOUNTPOINT="${MOUNTPOINTS[$num]}"
+
+    echo "Device selected: ${DEVICE} [${SIZE}] '${ID}' mount-point: '${MOUNTPOINT}'"
+    echo
+}
+
+do_sync() {
+    echo -n "Syncing, please wait..."
+    sudo sync && echo "Done"
+}
+
+# Check command line parameters
+
+# Check $1
+if [ ! -z "${1}" ]; then
+    SOURCE="${1}"
+
+    if [ ! -f "${SOURCE}" ] && [ ! -L "${SOURCE}" ] && [ ! -b "${SOURCE}" ]; then
+        echo "Error: source not found: '${SOURCE}'"
+        exit 1
+    fi
+
+    if [ -b "${SOURCE}" ]; then
+        SOURCE_TYPE="block"
+        SOURCE_SIZE=$(blockdev --getsize64 "${SOURCE}")
+    fi
+
+    if [ -f "${SOURCE}" ]; then
+        SOURCE_TYPE="iso"
+        SOURCE_SIZE=$(stat --printf "%s" "${SOURCE}")
+    fi
+fi
+
+# Check $2
+if [ ! -z "${2}" ]; then
+    TARGET="${2}"
+
+    if [ ! -b "${TARGET}" ] && echo "${TARGET}" | grep "/dev/"; then
+        echo "Error: Device '${TARGET}' is not a block device"
+        exit 1
+    fi
+fi
+
+# Show or select source
+if [ ! -z "${SOURCE}" ]; then
+    echo "Source '${SOURCE_TYPE}' selected: '${SOURCE}' size: $((SOURCE_SIZE/(1024 * 1024))) MB"
+else
+    echo "Select source device:"
+    select_block_device "rom"
+    SOURCE="${DEVICE}"
+    SOURCE_SIZE=$(blockdev --getsize64 "${SOURCE}")
+fi
+
+if [ -z "${SOURCE}" ]; then
+    echo "Error: source not selected"
+    exit 1
+fi
+
+# Show or select target
+if [ ! -z "${TARGET}" ]; then
+    echo "Device to write: '${TARGET}'"
+else
+    echo "Select target device:"
+    select_block_device "disk"
+    TARGET="${DEVICE}"
+fi
+
+if [ -z "${TARGET}" ]; then
+    echo "Error: target not selected"
+    exit 1
+fi
+
+# Confirm device write
+echo "Please confirm device write on '${TARGET}'"
+echo -n "[Enter 'y' or 'n', Ctrl+C to abort]:"
+
+read -r ans
+if ! [ "${ans}" == 'y' ]; then
+    echo "Write cancelled by user"
+    exit 1
+fi
+
+echo "Write confirmed by user for target: '${TARGET}'"
+echo
+
+# Check for super-user rights
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Please enter '$(whoami)' password to proceed:"
+    sudo echo "Rights granted"
+    echo
+fi
+
+# Check for additional commands
+if hash pv 1>/dev/null 2>&1; then
+    PV=" | pv -p -s ${SOURCE_SIZE} | dd status=none "
+else
+    PV=""
+fi
+
+# Umount selected device
+if [ -b "${TARGET}" ]; then
+    echo "Unmounting ${TARGET}*..."
+    sudo umount "${TARGET}"* || true
+fi
+
+# Write firmware
+echo "Writing '${SOURCE}' ($((SOURCE_SIZE / (1024 * 1024))) MB) to '${TARGET}'...Please wait"
+
+DD_CMD="dd status=none if=${SOURCE} ${PV} of=${TARGET}"
+sudo sh -c "${DD_CMD}"
+do_sync
+
+echo "Write completed: '${TARGET}'"
+echo
+
+# Verify firmware
+echo "'${TARGET}' ${SOURCE_SIZE} bytes verification started - please wait"
+
+SOURCE_MD5_FILE="/tmp/__$(basename "${SOURCE}").md5.tmp"
+TARGET_MD5_FILE="/tmp/__$(basename "${TARGET}").md5.tmp"
+
+# Dump source
+echo "Dumping source: '${SOURCE}'..."
+DD_CMD="dd status=none if=${SOURCE} count=1 bs=${SOURCE_SIZE} ${PV} | md5sum > ${SOURCE_MD5_FILE}"
+sudo sh -c "${DD_CMD}"
+do_sync
+
+SOURCE_MD5=$(cat "${SOURCE_MD5_FILE}" | awk '{ print $1 }')
+if [ -z "${SOURCE_MD5}" ]; then
+    echo "Error: Failed to calculate MD5 for: '${SOURCE}'"
+    exit 1
+fi
+
+# Dump target
+echo "Dumping target: '${TARGET}'..."
+DD_CMD="dd status=none if=${TARGET} count=1 bs=${SOURCE_SIZE} ${PV} | md5sum > ${TARGET_MD5_FILE}"
+sudo sh -c "${DD_CMD}"
+do_sync
+
+TARGET_MD5=$(cat "${TARGET_MD5_FILE}" | awk '{ print $1 }')
+if [ -z "${TARGET_MD5}" ]; then
+    echo "Error: Failed to calculate MD5 for: '${TARGET}'"
+    exit 1
+fi
+
+echo "Source MD5: ${SOURCE_MD5}"
+echo "Target MD5: ${TARGET_MD5}"
+
+# Compare MD5 sums
+if [ "${SOURCE_MD5}" != "${TARGET_MD5}" ]; then
+    echo "Error: write to '${TARGET}' failed: MD5 sum error"
+    exit 1
+fi
+
+# Done
+echo "Verification completed successfully"
+echo "Image '${SOURCE}' (${SOURCE_SIZE} bytes) successfully writed to '${TARGET}'"
+
+exit 0
